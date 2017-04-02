@@ -1,0 +1,170 @@
+import math
+import numpy as np
+import time
+import pandas
+
+from sklearn.neighbors import LSHForest
+from sklearn.base import BaseEstimator
+from sklearn.base import ClassifierMixin
+from sklearn.naive_bayes import MultinomialNB
+from collections import Counter
+from collections import OrderedDict
+
+
+
+def gaussian_parzen_function(r):
+    return math.pi**(-0.5) * math.exp(-0.5*r*r)
+
+def epan_parzen_function(r):
+    return 3/4*(1 - r*r)
+
+
+class LSHNearestNeighbors(BaseEstimator, ClassifierMixin):
+
+    def __init__(self, n_estimators=10, n_candidates=50, n_neighbors=9, mode="most_common", answers="one"):
+        self.n_estimator = n_estimators
+        self.n_candidates = n_candidates
+        self.n_neighbors = n_neighbors
+        assert mode in ["most_comon", "parzen_window"]
+        self.mode = mode
+        assert answers in ["one", "many"]
+        self.answers = answers
+
+    def fit(self, X, y):
+        self.INNER_NEIGHBORS = 50
+        self.lshforest_ = LSHForest(n_estimators=self.n_estimator, n_candidates=self.n_candidates,
+                                    n_neighbors=self.n_neighbors)
+        self.lshforest_.fit(X, y)
+        self.X_ = X
+        self.y_ = y
+        return self
+
+    def get_neighbors(self, x):
+        return [self.y_[mark] for mark in self.lshforest_.kneighbors(x)[1].tolist()[0]]
+
+    def get_neighbors_n_dists(self, x):
+        res = self.lshforest_.kneighbors(x)
+        return [(self.y_[res[1][0, i]], res[0][0, i]) for i in range(self.n_neighbors)]
+
+    def get_neighbors_n_dists_n_coordinates(self, x):
+        res = self.lshforest_.kneighbors(x)
+        return [(self.y_[res[1][0, i]], res[0][0, i], self.X_[res[1][0, i], :]) for i in range(self.n_neighbors)]
+
+    def get_quantile(self,p=0.9):
+        return pandas.DataFrame(self.times).quantile(p)
+
+    def predict(self, X):
+        self.times = []
+        y_pred = []
+        if self.mode == "most_common":
+            for x in X:
+                t1 = time.time()
+                kneighbors_y = self.get_neighbors(x)
+                self.times.append(time.time() - 1)
+                y_pred.append(Counter(kneighbors_y).most_common(1)[0][0])
+        elif self.mode == "parzen_window":
+            for x in X:
+                t1 = time.time()
+                k_n_d = self.get_neighbors_n_dists(x)
+                #print("k_n_d", k_n_d)
+                rating = OrderedDict()
+                max_ind = -1
+                max_rate = -1
+                if self.answers == "one":
+                    for i in range(self.n_neighbors):
+                        if k_n_d[i][0] not in rating.keys():
+                            rating[k_n_d[i][0]] = epan_parzen_function(k_n_d[i][1]/k_n_d[self.n_neighbors - 1][1])
+                        else:
+                            rating[k_n_d[i][0]] += epan_parzen_function(k_n_d[i][1]/k_n_d[self.n_neighbors - 1][1])
+                        if rating[k_n_d[i][0]] > max_rate:
+                            max_rate = rating[k_n_d[i][0]]
+                            max_ind = k_n_d[i][0]
+                    self.times.append(time.time() - t1)
+                    y_pred.append(max_ind)
+                elif self.answers == "many":
+                    for i in range(self.n_neighbors):
+                        if k_n_d[i][0] not in rating.keys():
+                            rating[k_n_d[i][0]] = epan_parzen_function(k_n_d[i][1]/k_n_d[self.n_neighbors - 1][1])
+                        else:
+                            rating[k_n_d[i][0]] += epan_parzen_function(k_n_d[i][1]/k_n_d[self.n_neighbors - 1][1])
+                    sum_weights = sum(rating[k] for k in rating)
+                    for k in rating:
+                        rating[k] /= sum_weights
+                    self.times.append(time.time() - t1)
+                    y_pred.append(rating)
+        return y_pred
+
+
+class Bayes_Wrapper(BaseEstimator, ClassifierMixin):
+    def __init__(self, alpha=1.0, num_answers=1, answers="one"):
+        self.alpha = alpha
+        assert answers in ["one", "many"]
+        self.answers = answers
+        self.num_answers = num_answers
+
+    def iter_minichunks(self, X, y, chunk_size):
+        num_chunks = X.shape[0]//chunk_size
+        for i in range(1, num_chunks):
+            yield X[(i - 1)*chunk_size : i*chunk_size, :], y[(i - 1)*chunk_size : i*chunk_size]
+
+    def fit(self, X, y):
+        self.inner_clf_ = MultinomialNB(alpha=self.alpha)
+        classes = np.unique(y)
+        chunkerator = self.iter_minichunks(X, y, chunk_size=100)
+        for X_chunk, y_chunk in chunkerator:
+            print(X_chunk.shape, y_chunk.shape)
+            print(type(X_chunk), type(y_chunk))
+            self.inner_clf_.partial_fit(X_chunk, y_chunk, classes=classes)
+
+    def predict(self, X, y):
+        if self.answers == "one":
+            return list(self.inner_clf_.predict(X))
+        elif self.answers == "many":
+            y_pred = []
+            for x in X:
+                probs = list(self.inner_clf_.predict_proba(x))[0]
+                probs_n_class = sorted([(self.classes_[i], probs[i]) for i in range(len(probs))], key=lambda item: item[1], reverse=True)[:self.num_answers]
+                sum_probs = sum(probs_n_class[i][1] for i in range(len(probs_n_class)))
+                normed_probs_n_class = [(probs_n_class[i][0], probs_n_class[i][1]/sum_probs) for i in range(len(probs_n_class))]
+                rating = OrderedDict(normed_probs_n_class)
+                y_pred.append(rating)
+            return y_pred
+
+
+class MixedClassifier:
+
+    def __init__(self, clfs, weights):
+        assert len(clfs) == len(weights)
+        for i in range(len(clfs)):
+            assert clfs[i].answers == "many"
+        self.clfs = clfs
+        self.weights = weights
+
+    def predict(self, X):
+        y_pred = []
+        for x in X:
+            max_rate = -1
+            max_ind = -1
+            total_rating = OrderedDict()
+            for i in range(len(self.clfs)):
+                rating = self.clfs[i].predict(x)
+                for k in rating:
+                    if k not in total_rating:
+                        total_rating[k] = rating[k]*self.weights[i]
+                    else:
+                        total_rating[k] += rating[k]*self.weights[i]
+                    if total_rating[k] > max_rate:
+                        max_rate = total_rating[k]
+                        max_ind = k
+            y_pred.append(max_ind)
+        return y_pred
+
+
+
+
+if __name__ == "__main__":
+    import sklearn
+    print(sklearn.__version__)
+
+
+
